@@ -1,0 +1,415 @@
+"use client";
+
+import { useEffect, useRef, useState, useCallback } from "react";
+import { VideoPlayer, type VideoPlayerHandle } from "./NewVideoPlayer";
+import {
+  doc,
+  onSnapshot,
+  updateDoc,
+  getDoc,
+  collection,
+  addDoc,
+  query,
+  orderBy,
+  serverTimestamp,
+} from "firebase/firestore";
+import { db, auth } from "@/lib/firebase";
+import { useAuthState } from "react-firebase-hooks/auth";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import MessageBubble from "@/components/chat/MessageBubble";
+
+interface RoomPageProps {
+  roomCode: string;
+}
+
+interface Message {
+  id: string;
+  text: string;
+  sender: string;
+  senderName?: string;
+  senderPhoto?: string;
+  createdAt?: Date;
+}
+
+interface RoomData {
+  videoUrl?: string;
+  isPlaying?: boolean;
+  currentTime?: number;
+  lastUpdated?: number;
+  updatedAt?: any; // For Firestore timestamp
+}
+
+export default function RoomPage({ roomCode }: RoomPageProps) {
+  const [user] = useAuthState(auth);
+  const videoPlayerRef = useRef<VideoPlayerHandle>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  
+  // Video state
+  const [videoState, setVideoState] = useState({
+    url: "",
+    isPlaying: false,
+    currentTime: 0,
+  });
+  
+  // UI state
+  const [urlInput, setUrlInput] = useState("");
+  const [chatInput, setChatInput] = useState("");
+  const [messages, setMessages] = useState<Message[]>([]);
+  
+  // Derived state
+  const roomId = roomCode;
+  const { url, isPlaying, currentTime } = videoState;
+
+  // Track if we're currently updating the video state to prevent feedback loops
+  const isUpdatingRef = useRef(false);
+  const lastSyncTimeRef = useRef(0);
+  const syncDebounceTimeout = useRef<NodeJS.Timeout | null>(null);
+
+  // Update video state in Firestore
+  const updateVideoState = useCallback(async (changes: Partial<RoomData>) => {
+    if (!roomId || isUpdatingRef.current) return;
+    
+    try {
+      isUpdatingRef.current = true;
+      console.log('Updating video state:', changes);
+      
+      // Update local state immediately for better UX
+      setVideoState(prev => ({
+        ...prev,
+        ...changes
+      }));
+      
+      // Debounce rapid updates to Firestore
+      if (syncDebounceTimeout.current) {
+        clearTimeout(syncDebounceTimeout.current);
+      }
+      
+      syncDebounceTimeout.current = setTimeout(async () => {
+        try {
+          const roomRef = doc(db, 'rooms', roomId);
+          await updateDoc(roomRef, {
+            ...changes,
+            lastUpdated: Date.now(),
+            updatedAt: serverTimestamp(),
+          });
+          console.log('Firestore updated successfully');
+        } catch (err) {
+          console.error('Error updating Firestore:', err);
+          setError('Failed to sync video state. Please refresh the page.');
+        } finally {
+          isUpdatingRef.current = false;
+        }
+      }, 500); // 500ms debounce
+    } catch (err) {
+      console.error('Error in updateVideoState:', err);
+      isUpdatingRef.current = false;
+    }
+  }, [roomId]);
+
+  // Handle video URL changes
+  const handleUrlSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!urlInput.trim()) return;
+    
+    updateVideoState({
+      videoUrl: urlInput,
+      isPlaying: true,
+      currentTime: 0
+    });
+    
+    setUrlInput("");
+  };
+
+  // Handle play/pause
+  const handlePlay = useCallback(() => {
+    if (!isPlaying) {
+      updateVideoState({ isPlaying: true });
+    }
+  }, [isPlaying, updateVideoState]);
+
+  const handlePause = useCallback(() => {
+    if (isPlaying) {
+      updateVideoState({ isPlaying: false });
+    }
+  }, [isPlaying, updateVideoState]);
+
+  // Handle seeking
+  const handleSeek = useCallback((time: number) => {
+    updateVideoState({ currentTime: time });
+  }, [updateVideoState]);
+
+  // Handle time updates (throttled by VideoPlayer)
+  const handleTimeUpdate = useCallback((time: number) => {
+    updateVideoState({ currentTime: time });
+  }, [updateVideoState]);
+
+  // Handle errors
+  const handleError = useCallback((error: string) => {
+    console.error('Video error:', error);
+    setError(error);
+  }, []);
+
+  // Initialize room and set up realtime updates
+  useEffect(() => {
+    if (!roomId) {
+      setError('Room ID is required');
+      setIsLoading(false);
+      return;
+    }
+
+    setIsLoading(true);
+    const roomRef = doc(db, 'rooms', roomId);
+    let isMounted = true;
+
+    // Initial load
+    getDoc(roomRef)
+      .then((snap) => {
+        if (!isMounted || !snap.exists()) return;
+        
+        const data = snap.data() as RoomData;
+        console.log('Initial room data:', data);
+        
+        // Update local state with data from Firestore
+        setVideoState(prev => ({
+          ...prev,
+          url: data.videoUrl || '',
+          isPlaying: data.isPlaying || false,
+          currentTime: data.currentTime || 0
+        }));
+        
+        // Seek to the correct time if needed
+        if (data.currentTime && videoPlayerRef.current) {
+          videoPlayerRef.current.seekTo(data.currentTime);
+        }
+      })
+      .catch((err) => {
+        console.error('Error loading room:', err);
+        setError('Failed to load room data');
+      })
+      .finally(() => {
+        if (isMounted) setIsLoading(false);
+      });
+
+    // Realtime updates
+    const unsubscribe = onSnapshot(roomRef, (snap) => {
+      if (!isMounted || !snap.exists()) return;
+      
+      const data = snap.data() as RoomData;
+      console.log('Room update:', data);
+      
+      // Skip if this update was triggered by us
+      if (isUpdatingRef.current) return;
+      
+      // Update local state with data from Firestore
+      setVideoState(prev => {
+        // Only update if something actually changed
+        if ((data.videoUrl !== undefined && data.videoUrl !== prev.url) ||
+            (data.isPlaying !== undefined && data.isPlaying !== prev.isPlaying) ||
+            (data.currentTime !== undefined && Math.abs((data.currentTime || 0) - prev.currentTime) > 1)) {
+          return {
+            ...prev,
+            url: data.videoUrl || prev.url,
+            isPlaying: data.isPlaying !== undefined ? data.isPlaying : prev.isPlaying,
+            currentTime: data.currentTime || 0
+          };
+        }
+        return prev;
+      });
+      
+      // Seek to the correct time if needed
+      if (data.currentTime !== undefined && videoPlayerRef.current) {
+        videoPlayerRef.current.seekTo(data.currentTime);
+      }
+    });
+
+    // Load chat messages
+    const messagesQuery = query(
+      collection(db, 'rooms', roomId, 'messages'),
+      orderBy('createdAt', 'asc')
+    );
+    
+    const unsubscribeMessages = onSnapshot(messagesQuery, (snapshot) => {
+      const msgs = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Message[];
+      setMessages(msgs);
+    });
+
+    return () => {
+      isMounted = false;
+      if (syncDebounceTimeout.current) {
+        clearTimeout(syncDebounceTimeout.current);
+      }
+      unsubscribe();
+      unsubscribeMessages();
+    };
+  }, [roomId]);
+
+  // Handle sending chat messages
+  const sendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !chatInput.trim()) return;
+    
+    try {
+      await addDoc(collection(db, 'rooms', roomId, 'messages'), {
+        text: chatInput,
+        sender: user.uid,
+        senderName: user.displayName || 'Anonymous',
+        senderPhoto: user.photoURL || '',
+        createdAt: serverTimestamp()
+      });
+      setChatInput('');
+    } catch (err) {
+      console.error('Error sending message:', err);
+      setError('Failed to send message');
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mx-auto"></div>
+          <p className="mt-4 text-gray-600">Loading room...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <div className="text-center p-6 bg-red-100 rounded-lg max-w-md">
+          <h2 className="text-xl font-semibold text-red-800 mb-2">Error</h2>
+          <p className="text-red-600 mb-4">{error}</p>
+          <Button 
+            onClick={() => window.location.reload()}
+            className="bg-red-600 hover:bg-red-700"
+          >
+            Refresh Page
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-screen bg-gray-100">
+      {/* Header */}
+      <header className="bg-white shadow-sm py-4 px-6">
+        <div className="max-w-7xl mx-auto flex justify-between items-center">
+          <h1 className="text-xl font-semibold text-gray-900">Room: {roomCode}</h1>
+          <div className="flex items-center space-x-4">
+            {user ? (
+              <div className="flex items-center space-x-2">
+                <span className="text-sm text-gray-700">{user.displayName || 'User'}</span>
+                <img 
+                  src={user.photoURL || '/default-avatar.png'} 
+                  alt="User" 
+                  className="h-8 w-8 rounded-full"
+                />
+              </div>
+            ) : (
+              <Button 
+                onClick={() => auth.signInWithPopup(new auth.GoogleAuthProvider())}
+                className="bg-blue-600 hover:bg-blue-700"
+              >
+                Sign In
+              </Button>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden">
+        {/* Video Player */}
+        <div className="flex-1 flex flex-col bg-black">
+          <div className="flex-1 relative">
+            <VideoPlayer
+              ref={videoPlayerRef}
+              src={url}
+              isPlaying={isPlaying}
+              currentTime={currentTime}
+              onPlay={handlePlay}
+              onPause={handlePause}
+              onSeek={handleSeek}
+              onTimeUpdate={handleTimeUpdate}
+              onError={handleError}
+            />
+          </div>
+          
+          {/* URL Input */}
+          <div className="p-4 bg-gray-800">
+            <form onSubmit={handleUrlSubmit} className="flex space-x-2">
+              <Input
+                type="text"
+                value={urlInput}
+                onChange={(e) => setUrlInput(e.target.value)}
+                placeholder="Enter video URL"
+                className="flex-1 bg-gray-700 text-white border-gray-600"
+              />
+              <Button type="submit" className="bg-blue-600 hover:bg-blue-700">
+                Load
+              </Button>
+            </form>
+          </div>
+        </div>
+
+        {/* Chat */}
+        <div className="w-80 border-l border-gray-200 bg-white flex flex-col">
+          <div className="p-4 border-b border-gray-200">
+            <h2 className="text-lg font-medium text-gray-900">Chat</h2>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            {messages.length === 0 ? (
+              <p className="text-sm text-gray-500 text-center py-8">
+                No messages yet. Say hello! 👋
+              </p>
+            ) : (
+              messages.map((message) => (
+                <MessageBubble
+                  key={message.id}
+                  message={message.text}
+                  isOwn={message.sender === user?.uid}
+                  senderName={message.senderName || 'Anonymous'}
+                  senderPhoto={message.senderPhoto}
+                  timestamp={message.createdAt?.toDate()}
+                />
+              ))
+            )}
+          </div>
+          
+          {user ? (
+            <form onSubmit={sendMessage} className="p-4 border-t border-gray-200">
+              <div className="flex space-x-2">
+                <Input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Type a message..."
+                  className="flex-1"
+                />
+                <Button type="submit" disabled={!chatInput.trim()}>
+                  Send
+                </Button>
+              </div>
+            </form>
+          ) : (
+            <div className="p-4 border-t border-gray-200 text-center">
+              <Button 
+                onClick={() => auth.signInWithPopup(new auth.GoogleAuthProvider())}
+                className="w-full bg-blue-600 hover:bg-blue-700"
+              >
+                Sign In to Chat
+              </Button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
