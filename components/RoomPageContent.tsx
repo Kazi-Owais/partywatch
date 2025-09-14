@@ -51,6 +51,7 @@ export default function RoomPage({ roomCode }: RoomPageProps) {
     url: "",
     isPlaying: false,
     currentTime: 0,
+    lastUpdated: 0, // Timestamp of last update to prevent race conditions
   });
   
   // UI state
@@ -61,7 +62,7 @@ export default function RoomPage({ roomCode }: RoomPageProps) {
   // Derived state
   const roomId = roomCode;
   const [isMounted, setIsMounted] = useState(false);
-  const { url, isPlaying } = videoState;
+  const { url, isPlaying, currentTime } = videoState;
 
   // Set isMounted to true after component mounts (client-side only)
   useEffect(() => {
@@ -177,6 +178,12 @@ export default function RoomPage({ roomCode }: RoomPageProps) {
   }, [roomId]);
 
   const updateVideoState = useCallback(async (changes: Partial<RoomData>) => {
+    const now = Date.now();
+    
+    // Skip if this update is too soon after the last one to prevent rapid updates
+    if (now - videoState.lastUpdated < 100) {
+      return;
+    }
     if (!roomId || isUpdatingRef.current) return;
     
     try {
@@ -187,7 +194,8 @@ export default function RoomPage({ roomCode }: RoomPageProps) {
       if (changes.videoUrl !== undefined || changes.isPlaying !== undefined || changes.currentTime !== undefined) {
         setVideoState(prev => ({
           ...prev,
-          ...changes
+          ...changes,
+          lastUpdated: now
         }));
       }
       
@@ -423,10 +431,16 @@ export default function RoomPage({ roomCode }: RoomPageProps) {
                     <VideoPlayer
                       src={url}
                       isPlaying={isPlaying}
+                      currentTime={videoState.currentTime}
                       onPlay={() => updateVideoState({ isPlaying: true })}
                       onPause={() => updateVideoState({ isPlaying: false })}
                       onSeek={(time) => updateVideoState({ currentTime: time })}
-                      onTimeUpdate={(time) => updateVideoState({ currentTime: time })}
+                      onTimeUpdate={(time) => {
+                        // Only update if the time change is significant to prevent too many updates
+                        if (Math.abs(time - videoState.currentTime) > 0.5) {
+                          updateVideoState({ currentTime: time });
+                        }
+                      }}
                       onError={(error) => setError(error)}
                     />
                   </div>
